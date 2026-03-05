@@ -1,0 +1,243 @@
+clc; clear; close all; 
+%% ========================================================== 
+% 1. LOAD DATA 
+%% ========================================================== 
+data = readtable('DATA1.xlsx','VariableNamingRule','preserve'); 
+vars = lower(data.Properties.VariableNames); 
+time    = data{:, find(contains(vars,'time'),1)}; 
+current = data{:, find(contains(vars,'curr'),1)}; 
+voltage = data{:, find(contains(vars,'volt'),1)}; 
+time = time(:); 
+current = current(:); 
+voltage = voltage(:); 
+valid = ~isnan(time) & ~isnan(current) & ~isnan(voltage); 
+time = time(valid); 
+current = current(valid); 
+voltage = voltage(valid); 
+if mean(current) < 0 
+current = -current; 
+end 
+dt = mean(diff(time)); 
+N  = length(time); 
+%% ========================================================== 
+% 2. CAPACITY ESTIMATION (DISCHARGE ONLY) 
+%% ========================================================== 
+discharge = current > 0; 
+Q_nom = trapz(time(discharge), current(discharge)) / 3600; 
+fprintf('Estimated Capacity = %.3f Ah\n', Q_nom); 
+if Q_nom < 1 
+warning('Unrealistic capacity detected. Setting 20 Ah default.'); 
+Q_nom = 20; 
+end 
+%% ========================================================== 
+% 3. TRUE SOC (COULOMB COUNTING) 
+%% ========================================================== 
+SOC_true = zeros(N,1); 
+SOC_true(1) = 1; 
+for k = 2:N 
+SOC_true(k) = SOC_true(k-1) - (current(k)*dt)/(Q_nom*3600); 
+end 
+SOC_true = max(0,min(1,SOC_true)); 
+%% ========================================================== 
+% 4. INITIAL OCV APPROXIMATION 
+%% ========================================================== 
+V_smooth = movmean(voltage,300); 
+lowCurrent = abs(current) < 0.5; 
+SOC_ocv = SOC_true(lowCurrent); 
+V_ocv   = V_smooth(lowCurrent); 
+if length(SOC_ocv) < 20 
+SOC_ocv = SOC_true; 
+V_ocv   = V_smooth; 
+end 
+[SOC_ocv,ia] = unique(round(SOC_ocv,3)); 
+V_ocv = V_ocv(ia); 
+deg = min(3,length(SOC_ocv)-1); 
+p = polyfit(SOC_ocv,V_ocv,deg); 
+%% ========================================================== 
+% 5. 2RC PARAMETER OPTIMIZATION 
+%% ========================================================== 
+cost = @(theta) cost2RC(theta,time,current,voltage,SOC_true,p); 
+theta0 = [0.01 0.02 2000 0.01 4000]; 
+lb = [0.001 0.001 500 0.001 1000]; 
+ub = [0.2 0.2 20000 0.2 20000]; 
+opts = optimoptions('fmincon','Display','none'); 
+theta = fmincon(cost,theta0,[],[],[],[],lb,ub,[],opts); 
+R0 = theta(1); 
+R1 = theta(2); 
+C1 = theta(3); 
+R2 = theta(4); 
+C2 = theta(5); 
+fprintf('\nEstimated 2RC Parameters:\n'); 
+fprintf('R0 = %.5f Ohm\n',R0); 
+fprintf('R1 = %.5f Ohm\n',R1); 
+fprintf('C1 = %.1f F\n',C1); 
+fprintf('R2 = %.5f Ohm\n',R2); 
+fprintf('C2 = %.1f F\n',C2); 
+%% ========================================================== 
+% 6. RC TIME CONSTANT VERIFICATION 
+%% ========================================================== 
+tau1 = R1*C1; 
+tau2 = R2*C2; 
+fprintf('\nTime Constants:\n'); 
+fprintf('Tau1 = %.2f s\n',tau1); 
+fprintf('Tau2 = %.2f s\n',tau2); 
+%% ========================================================== 
+% 7. EXTENDED KALMAN FILTER 
+%% ========================================================== 
+x = [1;0;0]; 
+P = eye(3)*1e-4; 
+Qk = diag([1e-6 1e-5 1e-5]); 
+Rk = 1e-3; 
+ 
+SOC_est = zeros(N,1); 
+ 
+for k = 2:N 
+     
+    a1 = exp(-dt/(R1*C1)); 
+    b1 = R1*(1-a1); 
+    a2 = exp(-dt/(R2*C2)); 
+    b2 = R2*(1-a2); 
+     
+    x_pred = [ 
+        x(1) - (current(k)*dt)/(Q_nom*3600); 
+        a1*x(2) + b1*current(k); 
+        a2*x(3) + b2*current(k) 
+    ]; 
+     
+    P_pred = P + Qk; 
+     
+    OCV  = polyval(p,x_pred(1)); 
+    dOCV = polyval(polyder(p),x_pred(1)); 
+     
+    V_pred = OCV - R0*current(k) - x_pred(2) - x_pred(3); 
+     
+    H = [dOCV -1 -1]; 
+     
+    K = P_pred*H'/(H*P_pred*H' + Rk); 
+     
+x = x_pred + K*(voltage(k) - V_pred); 
+x(1) = max(0,min(1,x(1))); 
+P = (eye(3)-K*H)*P_pred; 
+SOC_est(k) = x(1); 
+end 
+%% ========================================================== 
+% 8. PHYSICALLY CONSISTENT OCV RECONSTRUCTION 
+%% ========================================================== 
+V1 = zeros(N,1); 
+V2 = zeros(N,1); 
+for k = 2:N 
+a1 = exp(-dt/(R1*C1)); 
+b1 = R1*(1-a1); 
+a2 = exp(-dt/(R2*C2)); 
+b2 = R2*(1-a2); 
+V1(k) = a1*V1(k-1) + b1*current(k); 
+V2(k) = a2*V2(k-1) + b2*current(k); 
+end 
+OCV_rec = voltage + R0*current + V1 + V2; 
+validOCV = current > 0 & abs(current) < 5 & ... 
+SOC_est > 0.05 & SOC_est < 0.99 & ... 
+OCV_rec > 3.5 & OCV_rec < 4.3; 
+SOC_ocv_final = SOC_est(validOCV); 
+OCV_final     = OCV_rec(validOCV); 
+%% ========================================================== 
+% 9. ERROR METRICS 
+%% ========================================================== 
+validRegion = SOC_true > 0.02 & SOC_true < 0.98; 
+err = abs(SOC_true(validRegion) - SOC_est(validRegion)); 
+RMSE = sqrt(mean(err.^2))*100; 
+MAE  = mean(err)*100; 
+MAXE = max(err)*100; 
+fprintf('\nFinal SOC Performance:\n'); 
+fprintf('RMSE = %.3f %%\n',RMSE); 
+fprintf('MAE  = %.3f %%\n',MAE); 
+fprintf('MAX  = %.3f %%\n',MAXE); 
+%% ========================================================== 
+% 10. CURRENT OPERATING RANGE 
+%% ========================================================== 
+fprintf('\nCurrent Operating Range:\n'); 
+fprintf('Min Current = %.2f A\n',min(current)); 
+fprintf('Max Current = %.2f A\n',max(current)); 
+fprintf('Mean Current = %.2f A\n',mean(current)); 
+fprintf('Approx Max C-rate = %.2f C\n',max(current)/Q_nom); 
+%% ========================================================== 
+% 11. IDENTIFIABILITY CHECK 
+%% ========================================================== 
+theta = [R0 R1 C1 R2 C2]; 
+epsVal = 1e-4; 
+V_base = simulate2RC(theta,time,current,SOC_true,p); 
+S = zeros(N,5); 
+for i = 1:5 
+thetaPert = theta; 
+thetaPert(i) = thetaPert(i)*(1+epsVal); 
+V_pert = simulate2RC(thetaPert,time,current,SOC_true,p); 
+S(:,i) = (V_pert - V_base)/(theta(i)*epsVal); 
+end 
+FIM = S'*S; 
+condNumber = cond(FIM); 
+%% ========================================================== 
+% 12. PLOTS 
+%% ========================================================== 
+figure; 
+plot(time,SOC_true,'LineWidth',1.5); hold on; 
+plot(time,SOC_est,'LineWidth',1.5); 
+xlabel('Time (s)'); 
+ylabel('SOC'); 
+title('SOC vs Time'); 
+legend('True','EKF'); 
+grid on; 
+figure; 
+plot(time(validRegion),err*100,'LineWidth',1.5); 
+xlabel('Time (s)'); 
+ylabel('Absolute Error (%)'); 
+title('SOC Estimation Error'); 
+grid on; 
+figure; 
+scatter(SOC_ocv_final,OCV_final,15,'filled'); hold on; 
+p_final = polyfit(SOC_ocv_final,OCV_final,3); 
+SOC_plot = linspace(min(SOC_ocv_final),max(SOC_ocv_final),200); 
+plot(SOC_plot,polyval(p_final,SOC_plot),'LineWidth',2); 
+xlabel('SOC'); 
+ylabel('OCV (V)'); 
+title('Corrected OCV vs SOC'); 
+ylim([3.7 4.3]); 
+grid on; 
+%% ========================================================== 
+% COST FUNCTION 
+%% ========================================================== 
+function J = cost2RC(theta,time,current,voltage,SOC,p) 
+R0 = theta(1); R1 = theta(2); C1 = theta(3); 
+R2 = theta(4); C2 = theta(5); 
+dt = mean(diff(time)); 
+V1 = 0; V2 = 0; 
+N = length(time); 
+Vmodel = zeros(N,1); 
+for k = 2:N 
+a1 = exp(-dt/(R1*C1)); 
+b1 = R1*(1-a1); 
+a2 = exp(-dt/(R2*C2)); 
+b2 = R2*(1-a2); 
+V1 = a1*V1 + b1*current(k); 
+V2 = a2*V2 + b2*current(k); 
+OCV = polyval(p,SOC(k)); 
+Vmodel(k) = OCV - R0*current(k) - V1 - V2; 
+end 
+J = sum((voltage - Vmodel).^2); 
+end 
+function Vmodel = simulate2RC(theta,time,current,SOC,p) 
+R0 = theta(1); R1 = theta(2); C1 = theta(3); 
+R2 = theta(4); C2 = theta(5); 
+dt = mean(diff(time)); 
+V1 = 0; V2 = 0; 
+N = length(time); 
+Vmodel = zeros(N,1); 
+for k = 2:N 
+a1 = exp(-dt/(R1*C1)); 
+b1 = R1*(1-a1); 
+a2 = exp(-dt/(R2*C2)); 
+b2 = R2*(1-a2); 
+V1 = a1*V1 + b1*current(k); 
+V2 = a2*V2 + b2*current(k); 
+OCV = polyval(p,SOC(k)); 
+Vmodel(k) = OCV - R0*current(k) - V1 - V2; 
+end 
+end    
