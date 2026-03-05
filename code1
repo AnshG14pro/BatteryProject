@@ -1,0 +1,147 @@
+clc; clear; close all; 
+%% ========================================================== 
+% 1. LOAD DATA 
+%% ========================================================== 
+data = readtable('DATA1.xlsx','VariableNamingRule','preserve'); 
+vars = lower(data.Properties.VariableNames); 
+time    = data{:, find(contains(vars,'time'),1)}; 
+current = data{:, find(contains(vars,'curr'),1)}; 
+voltage = data{:, find(contains(vars,'volt'),1)}; 
+time = time(:); 
+current = current(:); 
+voltage = voltage(:); 
+valid = ~isnan(time) & ~isnan(current) & ~isnan(voltage); 
+time = time(valid); 
+current = current(valid); 
+voltage = voltage(valid); 
+if mean(current)<0 
+current = -current; 
+end 
+dt = mean(diff(time)); 
+N  = length(time); 
+%% ========================================================== 
+% 2. CAPACITY 
+%% ========================================================== 
+Q_nom = trapz(time(current>0),current(current>0))/3600; 
+if Q_nom < 1 
+Q_nom = 20; 
+end 
+fprintf('Estimated Capacity = %.3f Ah\n',Q_nom); 
+%% ========================================================== 
+% 3. TRUE SOC 
+%% ========================================================== 
+SOC_true = zeros(N,1); 
+SOC_true(1)=1; 
+for k=2:N 
+SOC_true(k)=SOC_true(k-1)-(current(k)*dt)/(Q_nom*3600); 
+end 
+SOC_true=max(0,min(1,SOC_true)); 
+%% ========================================================== 
+% 4. ROUGH 1RC PARAMETER FIT (Better Bounds) 
+%% ========================================================== 
+cost=@(theta) cost1RC(theta,time,current,voltage,SOC_true); 
+theta0=[0.01 0.02 3000]; 
+lb=[0.001 0.001 500]; 
+ub=[0.05 0.05 20000]; 
+opts=optimoptions('fmincon','Display','none'); 
+theta=fmincon(cost,theta0,[],[],[],[],lb,ub,[],opts); 
+R0=theta(1); 
+R1=theta(2); 
+C1=theta(3); 
+tau=R1*C1; 
+fprintf('\nOptimized 1RC Parameters:\n'); 
+fprintf('R0=%.5f Ohm\n',R0); 
+fprintf('R1=%.5f Ohm\n',R1); 
+fprintf('C1=%.1f F\n',C1); 
+fprintf('Tau=%.2f s\n',tau); 
+%% ========================================================== 
+% 5. RECONSTRUCT OCV FROM MODEL 
+%% ========================================================== 
+V1=zeros(N,1); 
+for k=2:N 
+a=exp(-dt/(R1*C1)); 
+b=R1*(1-a); 
+V1(k)=a*V1(k-1)+b*current(k); 
+end 
+OCV_rec=voltage+R0*current+V1; 
+validOCV=current>0 & OCV_rec>3.6 & OCV_rec<4.3; 
+SOC_ocv=SOC_true(validOCV); 
+OCV_clean=OCV_rec(validOCV); 
+[SOC_ocv,ia]=unique(round(SOC_ocv,3)); 
+OCV_clean=OCV_clean(ia); 
+p=polyfit(SOC_ocv,OCV_clean,3); 
+%% ========================================================== 
+% 6. EKF (TUNED) 
+%% ========================================================== 
+x=[1;0]; 
+P=eye(2)*1e-3; 
+Qk=diag([1e-7 1e-6]);     % lower process noise 
+Rk=5e-4;                 
+% lower measurement noise 
+SOC_est=zeros(N,1); 
+for k=2:N 
+a=exp(-dt/(R1*C1)); 
+b=R1*(1-a); 
+x_pred=[ 
+x(1)-(current(k)*dt)/(Q_nom*3600); 
+a*x(2)+b*current(k) 
+]; 
+P_pred=P+Qk; 
+OCV=polyval(p,x_pred(1)); 
+dOCV=polyval(polyder(p),x_pred(1)); 
+V_pred=OCV-R0*current(k)-x_pred(2); 
+H=[dOCV -1]; 
+K=P_pred*H'/(H*P_pred*H'+Rk); 
+x=x_pred+K*(voltage(k)-V_pred); 
+x(1)=max(0,min(1,x(1))); 
+P=(eye(2)-K*H)*P_pred; 
+SOC_est(k)=x(1); 
+end 
+%% ========================================================== 
+% 7. ERROR 
+%% ========================================================== 
+validRegion=SOC_true>0.05 & SOC_true<0.98; 
+err=abs(SOC_true(validRegion)-SOC_est(validRegion)); 
+RMSE=sqrt(mean(err.^2))*100; 
+MAE=mean(err)*100; 
+MAXE=max(err)*100; 
+fprintf('\nImproved SOC Performance:\n'); 
+fprintf('RMSE=%.3f %%\n',RMSE); 
+fprintf('MAE=%.3f %%\n',MAE); 
+fprintf('MAX=%.3f %%\n',MAXE); 
+%% ========================================================== 
+% 8. PLOTS 
+%% ========================================================== 
+figure; 
+plot(time,SOC_true,'LineWidth',1.5); hold on; 
+plot(time,SOC_est,'LineWidth',1.5); 
+title('SOC vs Time (Improved 1RC)'); 
+legend('True','EKF'); grid on; 
+figure; 
+plot(time(validRegion),err*100,'LineWidth',1.5); 
+title('Absolute SOC Error (%)'); grid on; 
+figure; 
+scatter(SOC_ocv,OCV_clean,20,'filled'); hold on; 
+SOC_plot=linspace(min(SOC_ocv),max(SOC_ocv),200); 
+plot(SOC_plot,polyval(p,SOC_plot),'LineWidth',2); 
+xlabel('SOC'); ylabel('OCV (V)'); 
+title('SOC vs OCV'); 
+grid on; 
+%% ========================================================== 
+function J=cost1RC(theta,time,current,voltage,SOC) 
+R0=theta(1); 
+R1=theta(2); 
+C1=theta(3); 
+dt=mean(diff(time)); 
+V1=0; 
+N=length(time); 
+Vmodel=zeros(N,1); 
+for k=2:N 
+a=exp(-dt/(R1*C1)); 
+b=R1*(1-a); 
+V1=a*V1+b*current(k); 
+OCV=voltage(k)+R0*current(k)+V1; % temporary 
+Vmodel(k)=OCV-R0*current(k)-V1; 
+end 
+J=sum((voltage-Vmodel).^2); 
+end   
